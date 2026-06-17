@@ -1,0 +1,21 @@
+# Ignore old capture app iterations
+capture-app/
+capture-app-51/
+vibe-capture-app/
+
+# Node
+node_modules/
+.expo/
+*.log
+
+# Python
+vibe-daemon/venv/
+vibe-daemon/__pycache__/
+*.pyc
+
+# Sensitive Firebase & Config Data
+vibe-daemon/serviceAccountKey.json
+vibe-daemon/system_config.json
+
+# OS files
+.DS_Store
