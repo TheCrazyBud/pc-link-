@@ -24,7 +24,8 @@ const database = getDatabase(app);
 const PROJECTS = [
   { label: "Pc Link", value: "PcLink" },
   { label: "QA QuaAnti", value: "QuaAnti" },
-  { label: "Texas AI", value: "TexasAi" }
+  { label: "Texas AI", value: "TexasAi" },
+  { label: "AIA", value: "AIA" }
 ];
 
 // Dynamic systems will be loaded from Firebase
@@ -51,6 +52,14 @@ export default function Index() {
   const [isNavOpen, setIsNavOpen] = useState(false);
   const [showCompletionModal, setShowCompletionModal] = useState(false);
   const scrollViewRef = useRef(null);
+
+  // Terminal States
+  const [activeTab, setActiveTab] = useState('vibe'); // 'vibe' | 'terminals'
+  const [terminals, setTerminals] = useState([]);
+  const [selectedTerminal, setSelectedTerminal] = useState('');
+  const [terminalLogs, setTerminalLogs] = useState([]);
+  const [terminalInput, setTerminalInput] = useState('');
+  const terminalScrollRef = useRef(null);
 
   useEffect(() => {
     (async () => {
@@ -100,6 +109,47 @@ export default function Index() {
     });
     return () => unsubscribe();
   }, [selectedSystem, selectedProject]);
+
+  // Listen to Active Terminals
+  useEffect(() => {
+    if (!selectedSystem) return;
+    const termRef = ref(database, `remote_terminals/${selectedSystem}/active`);
+    const unsubscribe = onValue(termRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const termsArray = Object.keys(data).map(key => ({
+          id: key,
+          ...data[key]
+        }));
+        setTerminals(termsArray);
+        if (termsArray.length > 0) {
+          setSelectedTerminal(prev => prev ? prev : termsArray[0].id);
+        }
+      } else {
+        setTerminals([]);
+      }
+    });
+    return () => unsubscribe();
+  }, [selectedSystem]);
+
+  // Listen to Selected Terminal Logs
+  useEffect(() => {
+    if (!selectedSystem || !selectedTerminal) {
+        setTerminalLogs([]);
+        return;
+    }
+    const logsRef = query(ref(database, `remote_terminals/${selectedSystem}/${selectedTerminal}/logs`), limitToLast(100));
+    const unsubscribe = onValue(logsRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const logsArray = Object.values(data).sort((a, b) => a.timestamp - b.timestamp);
+        setTerminalLogs(logsArray);
+      } else {
+        setTerminalLogs([]);
+      }
+    });
+    return () => unsubscribe();
+  }, [selectedSystem, selectedTerminal]);
 
   async function startRecording() {
     try {
@@ -199,6 +249,40 @@ export default function Index() {
       Alert.alert('Error', 'Failed to send retry command.');
     } finally {
       setIsProcessing(false);
+    }
+  }
+
+  async function spawnTerminal() {
+    try {
+      setIsProcessing(true);
+      const queueRef = ref(database, `remote_terminals/${selectedSystem}/control`);
+      await push(queueRef, {
+        type: 'spawn',
+        status: 'pending',
+        timestamp: serverTimestamp()
+      });
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function sendTerminalInput() {
+    if (!terminalInput.trim() || !selectedTerminal) return;
+    try {
+      const cmd = terminalInput;
+      setTerminalInput('');
+      const queueRef = ref(database, `remote_terminals/${selectedSystem}/control`);
+      await push(queueRef, {
+        type: 'input',
+        terminal_id: selectedTerminal,
+        command: cmd,
+        status: 'pending',
+        timestamp: serverTimestamp()
+      });
+    } catch (error) {
+      console.error(error);
     }
   }
 
@@ -312,13 +396,15 @@ export default function Index() {
             </TouchableOpacity>
             <View style={styles.headerTitles}>
               <Text style={styles.subtitle}>{activeSystemLabel}</Text>
-              <Text style={styles.title}>{activeProjectLabel}</Text>
+              <Text style={styles.title}>{activeTab === 'vibe' ? activeProjectLabel : 'Terminals'}</Text>
             </View>
           </View>
 
-          {/* Prompt Input Glass Card */}
-          <View style={[styles.glassContainer, styles.inputCard]}>
-            <GlassBackground intensity={50} tint="dark" />
+          {activeTab === 'vibe' ? (
+            <>
+              {/* Prompt Input Glass Card */}
+              <View style={[styles.glassContainer, styles.inputCard]}>
+                <GlassBackground intensity={50} tint="dark" />
             <TextInput
               style={styles.textInput}
               multiline
@@ -419,6 +505,90 @@ export default function Index() {
               )}
             </ScrollView>
           </View>
+          </>
+          ) : (
+            <>
+              {/* Terminal List Bar */}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.terminalListScroll}>
+                <TouchableOpacity 
+                  style={styles.terminalAddBtn}
+                  onPress={spawnTerminal}
+                  disabled={isProcessing}
+                >
+                  <Ionicons name="add" size={24} color="#ffffff" />
+                </TouchableOpacity>
+                {terminals.map(term => (
+                  <TouchableOpacity
+                    key={term.id}
+                    style={[styles.terminalTab, selectedTerminal === term.id && styles.terminalTabActive]}
+                    onPress={() => setSelectedTerminal(term.id)}
+                  >
+                    <Text style={[styles.terminalTabText, selectedTerminal === term.id && styles.terminalTabTextActive]}>
+                      TERM-{term.id.substring(0,4).toUpperCase()}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              {/* Terminal Console View */}
+              <View style={[styles.glassContainer, styles.consoleCard, { flex: 1 }]}>
+                <GlassBackground intensity={50} tint="dark" />
+                <ScrollView 
+                  style={styles.consoleScroll}
+                  contentContainerStyle={{ paddingBottom: 20 }}
+                  ref={terminalScrollRef}
+                  onContentSizeChange={() => terminalScrollRef.current?.scrollToEnd({ animated: true })}
+                >
+                  {terminalLogs.length === 0 ? (
+                    <Text style={styles.logTextEmpty}>Awaiting terminal output...</Text>
+                  ) : (
+                    <Text style={styles.logTextTerminal}>
+                      {terminalLogs.map(log => log.text).join('')}
+                    </Text>
+                  )}
+                </ScrollView>
+              </View>
+
+              {/* Terminal Input View */}
+              <View style={styles.terminalInputRow}>
+                <View style={[styles.glassContainer, styles.terminalInputContainer]}>
+                  <GlassBackground intensity={50} tint="dark" />
+                  <TextInput
+                    style={styles.terminalTextInput}
+                    placeholder="Type command..."
+                    placeholderTextColor="rgba(255, 255, 255, 0.4)"
+                    value={terminalInput}
+                    onChangeText={setTerminalInput}
+                    onSubmitEditing={sendTerminalInput}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                </View>
+                <TouchableOpacity style={styles.terminalSendBtn} onPress={sendTerminalInput}>
+                  <Ionicons name="return-down-back" size={24} color="#ffffff" />
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+
+          {/* Bottom Navigation Tabs */}
+          <View style={styles.bottomNav}>
+            <TouchableOpacity 
+              style={styles.navTab}
+              onPress={() => setActiveTab('vibe')}
+            >
+              <Ionicons name="chatbubbles" size={24} color={activeTab === 'vibe' ? '#0A84FF' : 'rgba(255,255,255,0.5)'} />
+              <Text style={[styles.navTabText, activeTab === 'vibe' && styles.navTabTextActive]}>Agent</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={styles.navTab}
+              onPress={() => setActiveTab('terminals')}
+            >
+              <Ionicons name="terminal" size={24} color={activeTab === 'terminals' ? '#0A84FF' : 'rgba(255,255,255,0.5)'} />
+              <Text style={[styles.navTabText, activeTab === 'terminals' && styles.navTabTextActive]}>Terminals</Text>
+            </TouchableOpacity>
+          </View>
+
         </KeyboardAvoidingView>
       </SafeAreaView>
     </LinearGradient>
@@ -612,5 +782,92 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     fontSize: 13,
     letterSpacing: 1.5,
+  },
+  
+  // --- Terminal UI ---
+  terminalListScroll: {
+    flexGrow: 0,
+    marginBottom: 16,
+  },
+  terminalAddBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  terminalTab: {
+    height: 44,
+    paddingHorizontal: 16,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 8,
+  },
+  terminalTabActive: {
+    backgroundColor: 'rgba(10, 132, 255, 0.2)',
+    borderWidth: 1,
+    borderColor: '#0A84FF',
+  },
+  terminalTabText: {
+    color: 'rgba(255,255,255,0.5)',
+    fontWeight: '600',
+    fontSize: 14,
+  },
+  terminalTabTextActive: {
+    color: '#0A84FF',
+  },
+  logTextTerminal: {
+    color: '#E2E8F0',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  terminalInputRow: {
+    flexDirection: 'row',
+    marginTop: 16,
+    marginBottom: 16,
+  },
+  terminalInputContainer: {
+    flex: 1,
+    height: 48,
+    marginRight: 12,
+    justifyContent: 'center',
+  },
+  terminalTextInput: {
+    color: '#ffffff',
+    paddingHorizontal: 16,
+    height: '100%',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 14,
+  },
+  terminalSendBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#0A84FF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  bottomNav: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.1)',
+  },
+  navTab: {
+    alignItems: 'center',
+  },
+  navTabText: {
+    color: 'rgba(255,255,255,0.5)',
+    fontSize: 12,
+    marginTop: 4,
+  },
+  navTabTextActive: {
+    color: '#0A84FF',
   },
 });

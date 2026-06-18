@@ -9,9 +9,13 @@ import pyperclip
 import pygetwindow as gw
 import glob
 import json
+import subprocess
+import uuid
+import queue
 
 # Stores the stop_event for each project's active tailer thread
 ACTIVE_TAILS = {}
+ACTIVE_TERMINALS = {}
 
 # Global lock to ensure pyautogui operations (focusing window, pasting, pressing enter)
 # happen sequentially, avoiding physical keyboard collisions across concurrent projects.
@@ -29,8 +33,8 @@ DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "https://pc-link-bca30-de
 
 PROJECTS = {
     "PcLink": {
-        "dir": r"C:\Users\Dell\Downloads\Pc Link",
-        "window_hint": "Pc Link"
+        "dir": r"C:\Users\Dell\Downloads\pc link",
+        "window_hint": "pc link"
     },
     "QuaAnti": {
         "dir": r"C:\Users\Dell\Downloads\QA",
@@ -39,6 +43,10 @@ PROJECTS = {
     "TexasAi": {
         "dir": r"C:\Users\Dell\Downloads\Texas_Ai",
         "window_hint": "Texas_Ai"
+    },
+    "AIA": {
+        "dir": r"C:\Users\Dell\Downloads\AIA",
+        "window_hint": "AIA"
     }
 }
 
@@ -87,13 +95,14 @@ except Exception as e:
 def find_ide_window(window_hint):
     """Find an Antigravity window whose title contains the project folder name."""
     all_windows = gw.getAllWindows()
+    hint_lower = window_hint.lower()
     for w in all_windows:
-        title = w.title.strip()
-        if "Antigravity" in title and window_hint in title:
+        title = w.title.strip().lower()
+        if "antigravity" in title and hint_lower in title:
             return w
     # Fallback: try any Antigravity window
     for w in all_windows:
-        if "Antigravity" in w.title.strip():
+        if "antigravity" in w.title.strip().lower():
             print(f"[WARN] Exact match for '{window_hint}' not found. Using: {w.title}")
             return w
     return None
@@ -293,6 +302,111 @@ def process_task(task):
         t.start()
 
 
+def terminal_stdout_reader(terminal_id, proc, q):
+    while True:
+        char = proc.stdout.read(1)
+        if not char:
+            break
+        q.put(char)
+    q.put(None)
+
+def terminal_queue_processor(terminal_id, q):
+    buffer = ""
+    while True:
+        try:
+            char = q.get(timeout=0.1)
+            if char is None:
+                if buffer:
+                    db.reference(f'remote_terminals/{SYSTEM_ID}/{terminal_id}/logs').push({
+                        'text': buffer,
+                        'timestamp': int(time.time() * 1000)
+                    })
+                db.reference(f'remote_terminals/{SYSTEM_ID}/{terminal_id}/logs').push({
+                    'text': "\n[Process Terminated]\n",
+                    'timestamp': int(time.time() * 1000)
+                })
+                break
+            buffer += char
+        except queue.Empty:
+            if buffer:
+                db.reference(f'remote_terminals/{SYSTEM_ID}/{terminal_id}/logs').push({
+                    'text': buffer,
+                    'timestamp': int(time.time() * 1000)
+                })
+                buffer = ""
+
+def handle_terminal_control(event):
+    if event.data is None:
+        return
+        
+    data_items = []
+    if isinstance(event.data, dict) and 'type' in event.data:
+        data_items = [(event.path, event.data)]
+    elif isinstance(event.data, dict):
+        for key, val in event.data.items():
+            if isinstance(val, dict):
+                data_items.append((f"/{key}", val))
+
+    for path_key, data in data_items:
+        if data.get('status') != 'pending':
+            continue
+            
+        action = data.get('type')
+        if action == 'spawn':
+            term_id = str(uuid.uuid4())[:8]
+            try:
+                proc = subprocess.Popen(
+                    ['cmd.exe'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                ACTIVE_TERMINALS[term_id] = proc
+                
+                q = queue.Queue()
+                threading.Thread(target=terminal_stdout_reader, args=(term_id, proc, q), daemon=True).start()
+                threading.Thread(target=terminal_queue_processor, args=(term_id, q), daemon=True).start()
+                
+                db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed', 'terminal_id': term_id})
+                print(f"[TERMINAL] Spawned terminal {term_id}")
+                
+                db.reference(f'remote_terminals/{SYSTEM_ID}/active/{term_id}').set({
+                    'status': 'running',
+                    'created_at': int(time.time() * 1000)
+                })
+            except Exception as e:
+                print(f"[TERMINAL ERROR] Failed to spawn: {e}")
+                db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed'})
+
+        elif action == 'input':
+            term_id = data.get('terminal_id')
+            cmd_text = data.get('command', '')
+            proc = ACTIVE_TERMINALS.get(term_id)
+            if proc and proc.poll() is None:
+                try:
+                    proc.stdin.write(cmd_text + "\n")
+                    proc.stdin.flush()
+                    db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
+                except Exception as e:
+                    print(f"[TERMINAL ERROR] Failed to send input: {e}")
+                    db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed'})
+            else:
+                db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed_dead'})
+
+        elif action == 'kill':
+            term_id = data.get('terminal_id')
+            proc = ACTIVE_TERMINALS.get(term_id)
+            if proc:
+                try:
+                    proc.terminate()
+                except:
+                    pass
+                del ACTIVE_TERMINALS[term_id]
+                db.reference(f'remote_terminals/{SYSTEM_ID}/active/{term_id}').remove()
+            db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
+
 def handle_new_prompt(event):
     """Fires when mobile app pushes to Firebase or on startup for existing nodes."""
     if event.data is None:
@@ -320,9 +434,19 @@ def handle_new_prompt(event):
                 threading.Thread(target=process_task, args=(task,), daemon=True).start()
 
 
+# Clean up any dead terminals from previous daemon runs
+try:
+    db.reference(f'remote_terminals/{SYSTEM_ID}/active').delete()
+    print("[INFO] Cleaned up dead terminal sessions.")
+except Exception as e:
+    pass
+
 # Attach the Firebase listener
 ref = db.reference(f'pending_prompts/{SYSTEM_ID}')
 ref.listen(handle_new_prompt)
+
+term_ref = db.reference(f'remote_terminals/{SYSTEM_ID}/control')
+term_ref.listen(handle_terminal_control)
 
 print(f"\n[READY] Vibe Daemon (System ID: {SYSTEM_ID.upper()}) actively listening to Firebase...")
 print("[INFO] True concurrency enabled. GUI Lock active.")
