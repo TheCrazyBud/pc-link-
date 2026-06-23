@@ -37,10 +37,28 @@ else:
 SERVICE_ACCOUNT_KEY_PATH = os.environ.get("FIREBASE_CREDENTIALS", os.path.join(application_path, "serviceAccountKey.json"))
 DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "https://pc-link-bca30-default-rtdb.firebaseio.com")
 
-# Workspace roots where projects are located
-WORKSPACE_ROOTS = [
-    r"C:\Users\Dell\Downloads",
-]
+# Workspace roots where projects are located (auto-detected)
+def _detect_workspace_roots():
+    """Auto-detect common workspace directories."""
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Downloads"),
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "Documents"),
+    ]
+    # Also add drive roots (D:\, E:\, etc.) on Windows
+    if sys.platform == 'win32':
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive) and letter != 'C':
+                candidates.append(drive)
+    return [c for c in candidates if os.path.isdir(c)]
+
+WORKSPACE_ROOTS = _detect_workspace_roots()
+
+# Auto-detect the Antigravity IDE brain directory for transcript tailing
+BRAIN_DIR = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-ide", "brain")
 
 # Dynamic project registry — populated by scan_projects()
 PROJECTS = {}
@@ -342,11 +360,13 @@ def process_task(task):
                 'timestamp': int(time.time() * 1000)
             })
 
-            # Wait for IDE to log the prompt (poll up to 5 times)
+            # Wait for IDE to log the prompt, then find the correct transcript
             latest_file = None
-            search_path = r"C:\Users\Dell\.gemini\antigravity-ide\brain\*\.system_generated\logs\transcript.jsonl"
+            search_path = os.path.join(BRAIN_DIR, "*", ".system_generated", "logs", "transcript.jsonl")
             prompt_json = json.dumps(prompt.strip())
             prompt_snippet = prompt_json[1:-1][:50]
+            # Use the project folder name for cross-device matching
+            project_folder_name = window_hint.lower()
             
             for _ in range(5):
                 time.sleep(1.0)
@@ -361,9 +381,10 @@ def process_task(task):
                         with open(f, 'r', encoding='utf-8') as file:
                             file.seek(0, 2)
                             size = file.tell()
-                            file.seek(max(0, size - 8192))
+                            file.seek(max(0, size - 16384))
                             tail_content = file.read()
-                            if prompt_snippet in tail_content:
+                            # Match BOTH prompt snippet AND project folder name
+                            if prompt_snippet in tail_content and project_folder_name in tail_content.lower():
                                 latest_file = f
                                 break
                     except Exception:
@@ -373,10 +394,22 @@ def process_task(task):
                     break
                     
             if not latest_file:
-                # Fallback: most recently modified overall if we STILL couldn't find the exact snippet
+                # Fallback: most recently modified transcript that mentions this project
+                # (NOT globally most-recent — that causes cross-project bleed)
                 files = glob.glob(search_path)
-                if files:
-                    latest_file = max(files, key=os.path.getmtime)
+                for f in sorted(files, key=os.path.getmtime, reverse=True):
+                    try:
+                        with open(f, 'r', encoding='utf-8') as file:
+                            file.seek(0, 2)
+                            size = file.tell()
+                            file.seek(max(0, size - 16384))
+                            tail_content = file.read()
+                            if project_folder_name in tail_content.lower():
+                                latest_file = f
+                                print(f"[TAILER] Fallback matched transcript for '{window_hint}': {f}")
+                                break
+                    except Exception:
+                        pass
         else:
             db.reference(db_path).update({"status": "failed_gui"})
             db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
