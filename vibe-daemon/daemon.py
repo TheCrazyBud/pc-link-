@@ -342,36 +342,40 @@ def process_task(task):
                 'timestamp': int(time.time() * 1000)
             })
 
-            # Wait for IDE to log the prompt
-            time.sleep(2.0)
+            # Wait for IDE to log the prompt (poll up to 5 times)
+            latest_file = None
             search_path = r"C:\Users\Dell\.gemini\antigravity-ide\brain\*\.system_generated\logs\transcript.jsonl"
-            files = glob.glob(search_path)
+            prompt_json = json.dumps(prompt.strip())
+            prompt_snippet = prompt_json[1:-1][:50]
             
-            if files:
-                # Strategy 1: Find transcript that was modified very recently (within last 10s)
-                now = time.time()
-                recent_files = [f for f in files if (now - os.path.getmtime(f)) < 10]
-                
-                if recent_files:
-                    # Among recent files, try to match by prompt content
-                    prompt_snippet = prompt.strip()[:50]
-                    for f in sorted(recent_files, key=os.path.getmtime, reverse=True):
-                        try:
-                            with open(f, 'r', encoding='utf-8') as file:
-                                file.seek(0, 2)
-                                size = file.tell()
-                                file.seek(max(0, size - 8192))
-                                tail_content = file.read()
-                                if prompt_snippet in tail_content:
-                                    latest_file = f
-                                    break
-                        except Exception:
-                            pass
+            for _ in range(5):
+                time.sleep(1.0)
+                files = glob.glob(search_path)
+                if not files:
+                    continue
                     
-                    if not latest_file:
-                        latest_file = max(recent_files, key=os.path.getmtime)
-                else:
-                    # Fallback: most recently modified overall
+                now = time.time()
+                recent_files = [f for f in files if (now - os.path.getmtime(f)) < 15]
+                for f in sorted(recent_files, key=os.path.getmtime, reverse=True):
+                    try:
+                        with open(f, 'r', encoding='utf-8') as file:
+                            file.seek(0, 2)
+                            size = file.tell()
+                            file.seek(max(0, size - 8192))
+                            tail_content = file.read()
+                            if prompt_snippet in tail_content:
+                                latest_file = f
+                                break
+                    except Exception:
+                        pass
+                        
+                if latest_file:
+                    break
+                    
+            if not latest_file:
+                # Fallback: most recently modified overall if we STILL couldn't find the exact snippet
+                files = glob.glob(search_path)
+                if files:
                     latest_file = max(files, key=os.path.getmtime)
         else:
             db.reference(db_path).update({"status": "failed_gui"})
