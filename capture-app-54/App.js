@@ -21,14 +21,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const database = getDatabase(app);
 
-const PROJECTS = [
-  { label: "Pc Link", value: "PcLink" },
-  { label: "QA QuaAnti", value: "QuaAnti" },
-  { label: "Texas AI", value: "TexasAi" },
-  { label: "AIA", value: "AIA" }
-];
-
-// Dynamic systems will be loaded from Firebase
+// Dynamic systems and projects will be loaded from Firebase
 
 // Android-safe Blur Wrapper
 const GlassBackground = ({ intensity = 50, tint = "dark", androidOpacity = 0.4 }) => {
@@ -46,7 +39,8 @@ export default function Index() {
   const [promptText, setPromptText] = useState('');
   const [systems, setSystems] = useState([]);
   const [selectedSystem, setSelectedSystem] = useState('');
-  const [selectedProject, setSelectedProject] = useState('PcLink');
+  const [projects, setProjects] = useState([]);
+  const [selectedProject, setSelectedProject] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [liveLogs, setLiveLogs] = useState([]);
   const [isNavOpen, setIsNavOpen] = useState(false);
@@ -89,6 +83,27 @@ export default function Index() {
     return () => unsubscribe();
   }, []);
 
+  // Listen to projects for the selected system
+  useEffect(() => {
+    if (!selectedSystem) return;
+    const projRef = ref(database, `systems/${selectedSystem}/projects`);
+    const unsubscribe = onValue(projRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const projArray = Object.values(data);
+        setProjects(projArray);
+        // Auto-select first project if current selection is not in the new list
+        setSelectedProject(prev => {
+          if (prev && projArray.some(p => p.value === prev)) return prev;
+          return projArray.length > 0 ? projArray[0].value : '';
+        });
+      } else {
+        setProjects([]);
+      }
+    });
+    return () => unsubscribe();
+  }, [selectedSystem]);
+
   useEffect(() => {
     if (!selectedSystem) return;
     const logsRef = query(ref(database, `live_logs/${selectedSystem}/${selectedProject}`), limitToLast(50));
@@ -110,10 +125,12 @@ export default function Index() {
     return () => unsubscribe();
   }, [selectedSystem, selectedProject]);
 
-  // Listen to Active Terminals
+  // Listen to Active Terminals - scoped by selectedProject to prevent cross-project bleed
   useEffect(() => {
-    if (!selectedSystem) return;
-    const termRef = ref(database, `remote_terminals/${selectedSystem}/active`);
+    if (!selectedSystem || !selectedProject) return;
+    setTerminals([]);
+    setSelectedTerminal('');
+    const termRef = ref(database, `remote_terminals/${selectedSystem}/${selectedProject}/active`);
     const unsubscribe = onValue(termRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -127,18 +144,19 @@ export default function Index() {
         }
       } else {
         setTerminals([]);
+        setSelectedTerminal('');
       }
     });
     return () => unsubscribe();
-  }, [selectedSystem]);
+  }, [selectedSystem, selectedProject]);
 
-  // Listen to Selected Terminal Logs
+  // Listen to Selected Terminal Logs - scoped by selectedProject
   useEffect(() => {
-    if (!selectedSystem || !selectedTerminal) {
+    if (!selectedSystem || !selectedProject || !selectedTerminal) {
         setTerminalLogs([]);
         return;
     }
-    const logsRef = query(ref(database, `remote_terminals/${selectedSystem}/${selectedTerminal}/logs`), limitToLast(100));
+    const logsRef = query(ref(database, `remote_terminals/${selectedSystem}/${selectedProject}/${selectedTerminal}/logs`), limitToLast(100));
     const unsubscribe = onValue(logsRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -149,7 +167,7 @@ export default function Index() {
       }
     });
     return () => unsubscribe();
-  }, [selectedSystem, selectedTerminal]);
+  }, [selectedSystem, selectedProject, selectedTerminal]);
 
   async function startRecording() {
     try {
@@ -258,6 +276,7 @@ export default function Index() {
       const queueRef = ref(database, `remote_terminals/${selectedSystem}/control`);
       await push(queueRef, {
         type: 'spawn',
+        project: selectedProject,
         status: 'pending',
         timestamp: serverTimestamp()
       });
@@ -276,6 +295,7 @@ export default function Index() {
       const queueRef = ref(database, `remote_terminals/${selectedSystem}/control`);
       await push(queueRef, {
         type: 'input',
+        project: selectedProject,
         terminal_id: selectedTerminal,
         command: cmd,
         status: 'pending',
@@ -287,7 +307,7 @@ export default function Index() {
   }
 
   const activeSystemLabel = systems.find(s => s.value === selectedSystem)?.label || "Loading Systems...";
-  const activeProjectLabel = PROJECTS.find(p => p.value === selectedProject)?.label || "Select Project";
+  const activeProjectLabel = projects.find(p => p.value === selectedProject)?.label || "Select Project";
 
   return (
     <LinearGradient colors={['#2A1B3D', '#12121A', '#0A0A0F']} style={styles.background}>
@@ -363,7 +383,10 @@ export default function Index() {
             <Text style={[styles.modalTitle, {marginTop: 24}]}>Projects</Text>
             
             <View style={styles.projectList}>
-              {PROJECTS.map((proj) => (
+              {projects.length === 0 ? (
+                <Text style={{color: 'rgba(255,255,255,0.5)', marginLeft: 16}}>No projects detected. Open a project in the IDE.</Text>
+              ) : (
+                projects.map((proj) => (
                 <TouchableOpacity 
                   key={proj.value} 
                   style={[styles.projectItem, selectedProject === proj.value && styles.projectItemActive]}
@@ -379,14 +402,15 @@ export default function Index() {
                     <Ionicons name="checkmark" size={24} color="#0A84FF" />
                   )}
                 </TouchableOpacity>
-              ))}
+                ))
+              )}
             </View>
           </View>
         </Modal>
 
       <SafeAreaView style={styles.safeArea}>
         <KeyboardAvoidingView 
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={styles.container}
         >
           {/* Header */}

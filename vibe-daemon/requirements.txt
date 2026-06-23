@@ -1,0 +1,4 @@
+firebase-admin
+pyautogui
+pyperclip
+PyGetWindow

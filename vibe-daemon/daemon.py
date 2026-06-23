@@ -28,27 +28,22 @@ pyautogui.PAUSE = 0.3  # Small delay between actions for reliability
 # -------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------
-SERVICE_ACCOUNT_KEY_PATH = os.environ.get("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
+# Get the folder where the executable or script is located
+if getattr(sys, 'frozen', False):
+    application_path = os.path.dirname(sys.executable)
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
+SERVICE_ACCOUNT_KEY_PATH = os.environ.get("FIREBASE_CREDENTIALS", os.path.join(application_path, "serviceAccountKey.json"))
 DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "https://pc-link-bca30-default-rtdb.firebaseio.com")
 
-PROJECTS = {
-    "PcLink": {
-        "dir": r"C:\Users\Dell\Downloads\pc link",
-        "window_hint": "pc link"
-    },
-    "QuaAnti": {
-        "dir": r"C:\Users\Dell\Downloads\QA",
-        "window_hint": "QA"
-    },
-    "TexasAi": {
-        "dir": r"C:\Users\Dell\Downloads\Texas_Ai",
-        "window_hint": "Texas_Ai"
-    },
-    "AIA": {
-        "dir": r"C:\Users\Dell\Downloads\AIA",
-        "window_hint": "AIA"
-    }
-}
+# Workspace roots where projects are located
+WORKSPACE_ROOTS = [
+    r"C:\Users\Dell\Downloads",
+]
+
+# Dynamic project registry — populated by scan_projects()
+PROJECTS = {}
 
 # 1. Initialize Firebase
 try:
@@ -60,7 +55,7 @@ except Exception as e:
     sys.exit(1)
 
 # 2. System Auto-Registration
-CONFIG_FILE = "system_config.json"
+CONFIG_FILE = os.path.join(application_path, "system_config.json")
 if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, 'r') as f:
         sys_config = json.load(f)
@@ -92,6 +87,89 @@ except Exception as e:
     print(f"[WARN] Failed to register system presence in cloud: {e}")
 
 
+def scan_projects():
+    """Auto-detect projects from open Antigravity IDE windows and push to Firebase."""
+    global PROJECTS
+    all_windows = gw.getAllWindows()
+    discovered = {}
+
+    for w in all_windows:
+        title = w.title.strip()
+        # Antigravity IDE titles look like: "FolderName - Antigravity IDE - filename.ext"
+        if ' - Antigravity IDE' not in title:
+            continue
+        
+        folder_name = title.split(' - Antigravity IDE')[0].strip()
+        if not folder_name:
+            continue
+
+        # Create a safe project ID from the folder name
+        project_id = "".join(c for c in folder_name if c.isalnum() or c in ('_', '-')).strip()
+        if not project_id:
+            continue
+
+        # Skip if already discovered in this scan
+        if project_id in discovered:
+            continue
+
+        # Find the actual directory on disk
+        project_dir = None
+        for root in WORKSPACE_ROOTS:
+            candidate = os.path.join(root, folder_name)
+            if os.path.isdir(candidate):
+                project_dir = candidate
+                break
+        
+        if not project_dir:
+            # Try case-insensitive search
+            for root in WORKSPACE_ROOTS:
+                if os.path.isdir(root):
+                    for entry in os.listdir(root):
+                        if entry.lower() == folder_name.lower() and os.path.isdir(os.path.join(root, entry)):
+                            project_dir = os.path.join(root, entry)
+                            break
+                if project_dir:
+                    break
+
+        if not project_dir:
+            print(f"[SCAN] Skipping '{folder_name}' — directory not found in workspace roots.")
+            continue
+
+        discovered[project_id] = {
+            "dir": project_dir,
+            "window_hint": folder_name,
+            "label": folder_name
+        }
+
+    # Update the global registry
+    if discovered != PROJECTS:
+        PROJECTS = discovered
+        # Push to Firebase so the mobile app can see them
+        try:
+            firebase_projects = {}
+            for pid, pconfig in PROJECTS.items():
+                firebase_projects[pid] = {
+                    "label": pconfig["label"],
+                    "value": pid
+                }
+            db.reference(f'systems/{SYSTEM_ID}/projects').set(firebase_projects)
+            print(f"[SCAN] Synced {len(PROJECTS)} projects to Firebase: {list(PROJECTS.keys())}")
+        except Exception as e:
+            print(f"[SCAN ERROR] Failed to push projects to Firebase: {e}")
+    
+    return PROJECTS
+
+
+def project_scanner_loop():
+    """Background thread that scans for projects every 30 seconds."""
+    while True:
+        try:
+            scan_projects()
+        except Exception as e:
+            print(f"[SCAN ERROR] {e}")
+        time.sleep(30)
+
+
 def find_ide_window(window_hint):
     """Find an Antigravity window whose title contains the project folder name."""
     all_windows = gw.getAllWindows()
@@ -100,34 +178,37 @@ def find_ide_window(window_hint):
         title = w.title.strip().lower()
         if "antigravity" in title and hint_lower in title:
             return w
-    # Fallback: try any Antigravity window
-    for w in all_windows:
-        if "antigravity" in w.title.strip().lower():
-            print(f"[WARN] Exact match for '{window_hint}' not found. Using: {w.title}")
-            return w
     return None
 
 
 def send_prompt_to_ide(window, prompt):
-    """Focus the IDE window, open chat, paste the prompt, and send it."""
+    """Focus the IDE window, open Command Palette, focus chat, paste, and send."""
     try:
         if window.isMinimized:
             window.restore()
             
-        # Aggressive focus stealing (Windows block bypass)
+        # Aggressive focus stealing (Windows blocks SetForegroundWindow)
         pyautogui.press('alt')
         window.activate()
         time.sleep(0.8)
         
-        # Click the title bar just to be absolutely certain it's the active window
+        # Click the title bar to ensure this is the active window
         title_x = window.left + (window.width // 2)
         title_y = window.top + 15
         pyautogui.click(title_x, title_y)
         time.sleep(0.5)
 
-        pyautogui.hotkey('ctrl', 'l')
+        # Open Command Palette
+        pyautogui.hotkey('ctrl', 'shift', 'p')
+        time.sleep(0.8)
+
+        # Type "Focus Chat" and press Enter to focus the chat input
+        pyautogui.typewrite('Focus Chat', interval=0.03)
+        time.sleep(0.5)
+        pyautogui.press('enter')
         time.sleep(1.0)
 
+        # Now the chat input should be focused — paste and send
         pyperclip.copy(prompt)
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.5)
@@ -224,7 +305,7 @@ def process_task(task):
 
     project_config = PROJECTS.get(project_id)
     if not project_config:
-        print(f"[ERROR] Unknown project '{project_id}'.")
+        print(f"[ERROR] Unknown project '{project_id}'. Known: {list(PROJECTS.keys())}")
         db.reference(db_path).update({"status": "failed_unknown_project"})
         return
 
@@ -246,6 +327,12 @@ def process_task(task):
 
     latest_file = None
 
+    # Immediately log that we received the prompt
+    db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
+        'text': f'\u2699\ufe0f Processing: "{prompt[:80]}..."' if len(prompt) > 80 else f'\u2699\ufe0f Processing: "{prompt}"',
+        'timestamp': int(time.time() * 1000)
+    })
+
     # CRITICAL SECTION: We lock the keyboard/mouse so we don't accidentally type into the wrong window
     with gui_lock:
         print(f"[LOCKED] Sending prompt to {ide_window.title}")
@@ -255,34 +342,48 @@ def process_task(task):
             db.reference(db_path).delete()
             print(f"[SUCCESS] Delivered prompt to {project_id}.")
             
+            db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
+                'text': '\U0001f4bb Prompt injected into IDE chat.',
+                'timestamp': int(time.time() * 1000)
+            })
+
             # Wait for IDE to log the prompt
-            time.sleep(1.5)
+            time.sleep(2.0)
             search_path = r"C:\Users\Dell\.gemini\antigravity-ide\brain\*\.system_generated\logs\transcript.jsonl"
             files = glob.glob(search_path)
             
-            matching_files = []
             if files:
-                prompt_snippet = prompt.strip()[:50] # Check first 50 chars of prompt
-                for f in files:
-                    try:
-                        # Read last few KB to find the prompt
-                        with open(f, 'r', encoding='utf-8') as file:
-                            file.seek(0, 2)
-                            size = file.tell()
-                            file.seek(max(0, size - 8192))
-                            tail_content = file.read()
-                            if prompt_snippet in tail_content:
-                                matching_files.append(f)
-                    except Exception:
-                        pass
+                # Strategy 1: Find transcript that was modified very recently (within last 10s)
+                now = time.time()
+                recent_files = [f for f in files if (now - os.path.getmtime(f)) < 10]
                 
-                if matching_files:
-                    latest_file = max(matching_files, key=os.path.getmtime)
+                if recent_files:
+                    # Among recent files, try to match by prompt content
+                    prompt_snippet = prompt.strip()[:50]
+                    for f in sorted(recent_files, key=os.path.getmtime, reverse=True):
+                        try:
+                            with open(f, 'r', encoding='utf-8') as file:
+                                file.seek(0, 2)
+                                size = file.tell()
+                                file.seek(max(0, size - 8192))
+                                tail_content = file.read()
+                                if prompt_snippet in tail_content:
+                                    latest_file = f
+                                    break
+                        except Exception:
+                            pass
+                    
+                    if not latest_file:
+                        latest_file = max(recent_files, key=os.path.getmtime)
                 else:
-                    # Fallback if somehow not found in text
+                    # Fallback: most recently modified overall
                     latest_file = max(files, key=os.path.getmtime)
         else:
             db.reference(db_path).update({"status": "failed_gui"})
+            db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
+                'text': '\u274c Failed to inject prompt into IDE.',
+                'timestamp': int(time.time() * 1000)
+            })
     
     # End of lock. Other projects can now type.
 
@@ -298,6 +399,7 @@ def process_task(task):
         stop_event = threading.Event()
         ACTIVE_TAILS[project_id] = stop_event
         
+        print(f"[TAILER] Tailing: {latest_file}")
         t = threading.Thread(target=log_tailer, args=(project_id, latest_file, stop_event), daemon=True)
         t.start()
 
@@ -310,18 +412,18 @@ def terminal_stdout_reader(terminal_id, proc, q):
         q.put(char)
     q.put(None)
 
-def terminal_queue_processor(terminal_id, q):
+def terminal_queue_processor(terminal_id, project_id, q):
     buffer = ""
     while True:
         try:
             char = q.get(timeout=0.1)
             if char is None:
                 if buffer:
-                    db.reference(f'remote_terminals/{SYSTEM_ID}/{terminal_id}/logs').push({
+                    db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
                         'text': buffer,
                         'timestamp': int(time.time() * 1000)
                     })
-                db.reference(f'remote_terminals/{SYSTEM_ID}/{terminal_id}/logs').push({
+                db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
                     'text': "\n[Process Terminated]\n",
                     'timestamp': int(time.time() * 1000)
                 })
@@ -329,7 +431,7 @@ def terminal_queue_processor(terminal_id, q):
             buffer += char
         except queue.Empty:
             if buffer:
-                db.reference(f'remote_terminals/{SYSTEM_ID}/{terminal_id}/logs').push({
+                db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
                     'text': buffer,
                     'timestamp': int(time.time() * 1000)
                 })
@@ -350,6 +452,9 @@ def handle_terminal_control(event):
     for path_key, data in data_items:
         if data.get('status') != 'pending':
             continue
+
+        # --- Read which project this terminal belongs to ---
+        project_id = data.get('project', 'default')
             
         action = data.get('type')
         if action == 'spawn':
@@ -363,16 +468,18 @@ def handle_terminal_control(event):
                     text=True,
                     bufsize=1
                 )
-                ACTIVE_TERMINALS[term_id] = proc
+                # Store terminal keyed by project so outputs are isolated
+                ACTIVE_TERMINALS[term_id] = {'proc': proc, 'project_id': project_id}
                 
                 q = queue.Queue()
                 threading.Thread(target=terminal_stdout_reader, args=(term_id, proc, q), daemon=True).start()
-                threading.Thread(target=terminal_queue_processor, args=(term_id, q), daemon=True).start()
+                threading.Thread(target=terminal_queue_processor, args=(term_id, project_id, q), daemon=True).start()
                 
                 db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed', 'terminal_id': term_id})
-                print(f"[TERMINAL] Spawned terminal {term_id}")
+                print(f"[TERMINAL] Spawned terminal {term_id} for project '{project_id}'")
                 
-                db.reference(f'remote_terminals/{SYSTEM_ID}/active/{term_id}').set({
+                # Register under the project namespace so app only sees its own terminals
+                db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/active/{term_id}').set({
                     'status': 'running',
                     'created_at': int(time.time() * 1000)
                 })
@@ -383,7 +490,8 @@ def handle_terminal_control(event):
         elif action == 'input':
             term_id = data.get('terminal_id')
             cmd_text = data.get('command', '')
-            proc = ACTIVE_TERMINALS.get(term_id)
+            entry = ACTIVE_TERMINALS.get(term_id)
+            proc = entry['proc'] if entry else None
             if proc and proc.poll() is None:
                 try:
                     proc.stdin.write(cmd_text + "\n")
@@ -397,14 +505,15 @@ def handle_terminal_control(event):
 
         elif action == 'kill':
             term_id = data.get('terminal_id')
-            proc = ACTIVE_TERMINALS.get(term_id)
-            if proc:
+            entry = ACTIVE_TERMINALS.get(term_id)
+            if entry:
                 try:
-                    proc.terminate()
+                    entry['proc'].terminate()
                 except:
                     pass
+                proj = entry.get('project_id', project_id)
                 del ACTIVE_TERMINALS[term_id]
-                db.reference(f'remote_terminals/{SYSTEM_ID}/active/{term_id}').remove()
+                db.reference(f'remote_terminals/{SYSTEM_ID}/{proj}/active/{term_id}').remove()
             db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
 
 def handle_new_prompt(event):
@@ -434,12 +543,22 @@ def handle_new_prompt(event):
                 threading.Thread(target=process_task, args=(task,), daemon=True).start()
 
 
-# Clean up any dead terminals from previous daemon runs
+# Run initial project scan before starting listeners
+print("[INFO] Running initial project scan...")
+scan_projects()
+
+# Clean up any dead terminals from previous daemon runs (per-project namespaces)
 try:
-    db.reference(f'remote_terminals/{SYSTEM_ID}/active').delete()
+    for proj_key in list(PROJECTS.keys()):
+        db.reference(f'remote_terminals/{SYSTEM_ID}/{proj_key}/active').delete()
     print("[INFO] Cleaned up dead terminal sessions.")
 except Exception as e:
     pass
+
+# Start background project scanner thread (every 30s)
+scanner_thread = threading.Thread(target=project_scanner_loop, daemon=True)
+scanner_thread.start()
+print("[INFO] Project auto-detection scanner started (30s interval).")
 
 # Attach the Firebase listener
 ref = db.reference(f'pending_prompts/{SYSTEM_ID}')
@@ -450,6 +569,7 @@ term_ref.listen(handle_terminal_control)
 
 print(f"\n[READY] Vibe Daemon (System ID: {SYSTEM_ID.upper()}) actively listening to Firebase...")
 print("[INFO] True concurrency enabled. GUI Lock active.")
+print(f"[INFO] Discovered projects: {list(PROJECTS.keys())}")
 try:
     while True:
         time.sleep(1)
