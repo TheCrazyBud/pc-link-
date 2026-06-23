@@ -182,33 +182,28 @@ def find_ide_window(window_hint):
 
 
 def send_prompt_to_ide(window, prompt):
-    """Focus the IDE window, open Command Palette, focus chat, paste, and send."""
+    """Focus the IDE window, open chat, paste the prompt, and send it."""
     try:
         if window.isMinimized:
             window.restore()
             
-        # Aggressive focus stealing (Windows blocks SetForegroundWindow)
+        # Aggressive focus stealing (Windows block bypass)
         pyautogui.press('alt')
         window.activate()
         time.sleep(0.8)
-        
-        # Click the title bar to ensure this is the active window
-        title_x = window.left + (window.width // 2)
-        title_y = window.top + 15
-        pyautogui.click(title_x, title_y)
+
+        # Escape first to dismiss any open chat panel, menus, or overlays.
+        # This ensures Ctrl+L will OPEN the chat (not toggle it closed).
+        pyautogui.press('escape')
+        time.sleep(0.3)
+        pyautogui.press('escape')
         time.sleep(0.5)
 
-        # Open Command Palette
-        pyautogui.hotkey('ctrl', 'shift', 'p')
-        time.sleep(0.8)
-
-        # Type "Focus Chat" and press Enter to focus the chat input
-        pyautogui.typewrite('Focus Chat', interval=0.03)
-        time.sleep(0.5)
-        pyautogui.press('enter')
+        # Now Ctrl+L will reliably open a fresh chat input
+        pyautogui.hotkey('ctrl', 'l')
         time.sleep(1.0)
 
-        # Now the chat input should be focused — paste and send
+        # Paste the prompt and send
         pyperclip.copy(prompt)
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.5)
@@ -335,7 +330,7 @@ def process_task(task):
 
     # CRITICAL SECTION: We lock the keyboard/mouse so we don't accidentally type into the wrong window
     with gui_lock:
-        print(f"[LOCKED] Sending prompt to {ide_window.title}")
+        print(f"[LOCKED] Sending prompt to {ide_window.title.encode('ascii', 'replace').decode()}")
         success = send_prompt_to_ide(ide_window, prompt)
 
         if success:
