@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, TextInput, TouchableOpacity, ActivityIndicator, Alert, ScrollView, KeyboardAvoidingView, Platform, SafeAreaView, Modal } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio } from 'expo-av';
 import axios from 'axios';
 import { initializeApp } from 'firebase/app';
@@ -33,6 +34,34 @@ const GlassBackground = ({ intensity = 50, tint = "dark", androidOpacity = 0.4 }
   return <View style={[StyleSheet.absoluteFill, { backgroundColor: bgColor }]} />;
 };
 
+const LogEntry = ({ log }) => {
+  const [expanded, setExpanded] = useState(false);
+  const isThinking = log.type === 'thinking';
+  const isResult = log.type === 'result';
+  const isCollapsible = isThinking || (isResult && log.text.length > 200);
+
+  let logStyle = styles.logText;
+  if (log.type === 'user') logStyle = [styles.logText, styles.logUser];
+  else if (log.type === 'tool_call') logStyle = [styles.logText, styles.logTool];
+  else if (log.type === 'status' && log.text.startsWith('💻')) logStyle = [styles.logText, styles.logCmd];
+  else if (isThinking) logStyle = [styles.logText, styles.logThinking];
+  else if (isResult) logStyle = [styles.logText, styles.logResult];
+
+  const displayText = (isCollapsible && !expanded) 
+    ? (isThinking ? "🧠 [Thinking... tap to expand]" : `📋 Result: [${log.text.length} chars... tap to expand]`)
+    : log.text;
+
+  if (isCollapsible) {
+    return (
+      <TouchableOpacity onPress={() => setExpanded(!expanded)} activeOpacity={0.7} style={{marginBottom: 6}}>
+        <Text style={logStyle}>{displayText}</Text>
+      </TouchableOpacity>
+    );
+  }
+
+  return <Text style={[logStyle, {marginBottom: 6}]}>{log.text}</Text>;
+};
+
 export default function Index() {
   const [recording, setRecording] = useState();
   const [isRecording, setIsRecording] = useState(false);
@@ -54,6 +83,15 @@ export default function Index() {
   const [terminalLogs, setTerminalLogs] = useState([]);
   const [terminalInput, setTerminalInput] = useState('');
   const terminalScrollRef = useRef(null);
+  const [lastPrompt, setLastPrompt] = useState('');
+
+  // Load last prompt from AsyncStorage when project changes
+  useEffect(() => {
+    if (!selectedProject) return;
+    AsyncStorage.getItem(`lastPrompt_${selectedProject}`).then(val => {
+      setLastPrompt(val || '');
+    });
+  }, [selectedProject]);
 
   useEffect(() => {
     (async () => {
@@ -106,18 +144,44 @@ export default function Index() {
 
   useEffect(() => {
     if (!selectedSystem) return;
-    const logsRef = query(ref(database, `live_logs/${selectedSystem}/${selectedProject}`), limitToLast(50));
+    const logsRef = query(ref(database, `live_logs/${selectedSystem}/${selectedProject}`), limitToLast(200));
     const unsubscribe = onValue(logsRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
-        const logsArray = Object.values(data).sort((a, b) => a.timestamp - b.timestamp);
-        if (logsArray.length > 0 && logsArray[logsArray.length - 1].text === '[STATUS: DONE]') {
-          const timeDiff = Date.now() - logsArray[logsArray.length - 1].timestamp;
+        const rawLogs = Object.values(data).sort((a, b) => a.timestamp - b.timestamp);
+        
+        // Reassemble chunked logs
+        const groupedLogs = [];
+        const chunkMap = {};
+        
+        for (const log of rawLogs) {
+          if (log.chunk_group) {
+            if (!chunkMap[log.chunk_group]) {
+              chunkMap[log.chunk_group] = [];
+            }
+            chunkMap[log.chunk_group].push(log);
+          } else {
+            groupedLogs.push(log);
+          }
+        }
+        
+        for (const groupId in chunkMap) {
+          const chunks = chunkMap[groupId];
+          chunks.sort((a, b) => (a.chunk_index || 0) - (b.chunk_index || 0));
+          const assembledLog = { ...chunks[0] };
+          assembledLog.text = chunks.map(c => c.text).join('');
+          groupedLogs.push(assembledLog);
+        }
+        
+        groupedLogs.sort((a, b) => a.timestamp - b.timestamp);
+
+        if (groupedLogs.length > 0 && groupedLogs[groupedLogs.length - 1].type === 'status' && groupedLogs[groupedLogs.length - 1].text === '[STATUS: DONE]') {
+          const timeDiff = Date.now() - groupedLogs[groupedLogs.length - 1].timestamp;
           if (timeDiff < 5000) {
             setShowCompletionModal(true);
           }
         }
-        setLiveLogs(logsArray);
+        setLiveLogs(groupedLogs);
       } else {
         setLiveLogs([]);
       }
@@ -243,6 +307,9 @@ export default function Index() {
         status: 'pending',
         timestamp: serverTimestamp()
       });
+      // Save last prompt per project
+      setLastPrompt(promptText);
+      AsyncStorage.setItem(`lastPrompt_${selectedProject}`, promptText);
       setPromptText('');
     } catch (error) {
       console.error('Database error:', error);
@@ -485,6 +552,24 @@ export default function Index() {
               <Ionicons name="refresh" size={20} color="#FF9500" style={{marginBottom: 4}} />
               <Text style={styles.actionButtonText}>Retry</Text>
             </TouchableOpacity>
+
+            {/* Restore Button */}
+            <TouchableOpacity 
+              style={[styles.actionButtonWrapper, {flex: 1}]}
+              onPress={() => {
+                if (lastPrompt) {
+                  setPromptText(lastPrompt);
+                } else {
+                  Alert.alert('No History', 'No previous prompt found for this project.');
+                }
+              }}
+              disabled={isProcessing}
+              activeOpacity={0.7}
+            >
+              <GlassBackground intensity={50} tint="dark" />
+              <Ionicons name="arrow-undo" size={20} color="#5E5CE6" style={{marginBottom: 4}} />
+              <Text style={styles.actionButtonText}>Restore</Text>
+            </TouchableOpacity>
           </View>
 
           {/* Telemetry Console */}
@@ -513,18 +598,7 @@ export default function Index() {
                       </View>
                     );
                   }
-                  
-                  let logStyle = styles.logText;
-                  if (log.text.startsWith('👤')) logStyle = [styles.logText, styles.logUser];
-                  else if (log.text.startsWith('⚙️')) logStyle = [styles.logText, styles.logTool];
-                  else if (log.text.startsWith('💻')) logStyle = [styles.logText, styles.logCmd];
-                  else if (log.text.startsWith('📝')) logStyle = [styles.logText, styles.logFile];
-
-                  return (
-                    <Text key={index} style={logStyle}>
-                      {log.text}
-                    </Text>
-                  );
+                  return <LogEntry key={index} log={log} />;
                 })
               )}
             </ScrollView>
@@ -792,6 +866,8 @@ const styles = StyleSheet.create({
   logTool: { color: '#64D2FF' },
   logCmd: { color: '#BF5AF2' },
   logFile: { color: '#FF375F' },
+  logThinking: { color: '#A284F0', fontStyle: 'italic', opacity: 0.8 },
+  logResult: { color: '#34C759', backgroundColor: 'rgba(52, 199, 89, 0.05)', padding: 4, borderRadius: 4 },
   doneBanner: {
     flexDirection: 'row',
     alignItems: 'center',

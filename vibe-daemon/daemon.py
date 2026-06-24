@@ -117,7 +117,9 @@ def scan_projects():
         if ' - Antigravity IDE' not in title:
             continue
         
-        folder_name = title.split(' - Antigravity IDE')[0].strip()
+        raw_prefix = title.split(' - Antigravity IDE')[0].strip()
+        parts = raw_prefix.split(' - ')
+        folder_name = parts[-1].strip()
         if not folder_name:
             continue
 
@@ -233,6 +235,123 @@ def send_prompt_to_ide(window, prompt):
         return False
 
 
+def _push_log(project_id, text, log_type="response", tool_name=None, file_path_ref=None):
+    """Push a single log entry to Firebase, chunking if necessary."""
+    MAX_CHUNK = 2000
+    base_payload = {
+        'type': log_type,
+        'timestamp': int(time.time() * 1000)
+    }
+    if tool_name:
+        base_payload['tool'] = tool_name
+    if file_path_ref:
+        base_payload['file'] = file_path_ref
+
+    if len(text) <= MAX_CHUNK:
+        base_payload['text'] = text
+        db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push(base_payload)
+    else:
+        # Chunk large messages
+        chunk_id = str(uuid.uuid4())[:8]
+        chunks = [text[i:i+MAX_CHUNK] for i in range(0, len(text), MAX_CHUNK)]
+        for idx, chunk in enumerate(chunks):
+            payload = {**base_payload}
+            payload['text'] = chunk
+            payload['chunk_group'] = chunk_id
+            payload['chunk_index'] = idx
+            db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push(payload)
+
+
+def _describe_tool_call(name, args):
+    """Build a rich description string for any tool call."""
+    if name in ('replace_file_content', 'multi_replace_file_content'):
+        target = args.get('TargetFile', 'unknown file')
+        desc = args.get('Description', args.get('Instruction', ''))
+        replacement = args.get('ReplacementContent', '')
+        chunks = args.get('ReplacementChunks', [])
+        parts = [f"📝 EDIT: {target}"]
+        if desc:
+            parts.append(f"   Description: {desc}")
+        if replacement:
+            parts.append(f"   Content:\n{replacement}")
+        if chunks:
+            for i, ch in enumerate(chunks):
+                rc = ch.get('ReplacementContent', '')
+                tc = ch.get('TargetContent', '')
+                parts.append(f"   --- Chunk {i+1} ---")
+                if tc:
+                    parts.append(f"   - Target:\n{tc}")
+                if rc:
+                    parts.append(f"   + Replacement:\n{rc}")
+        return '\n'.join(parts), target
+
+    elif name == 'write_to_file':
+        target = args.get('TargetFile', 'unknown file')
+        desc = args.get('Description', '')
+        content = args.get('CodeContent', '')
+        parts = [f"📝 CREATE FILE: {target}"]
+        if desc:
+            parts.append(f"   Description: {desc}")
+        if content:
+            parts.append(f"   Content:\n{content}")
+        return '\n'.join(parts), target
+
+    elif name == 'view_file':
+        target = args.get('AbsolutePath', 'unknown file')
+        start = args.get('StartLine', '')
+        end = args.get('EndLine', '')
+        line_info = f" (lines {start}-{end})" if start else ""
+        return f"👁️ VIEW FILE: {target}{line_info}", target
+
+    elif name == 'run_command':
+        cmd = args.get('CommandLine', 'command')
+        cwd = args.get('Cwd', '')
+        return f"💻 COMMAND: {cmd}\n   CWD: {cwd}", None
+
+    elif name == 'grep_search':
+        query = args.get('Query', '')
+        path = args.get('SearchPath', '')
+        return f"🔍 SEARCH: \"{query}\" in {path}", None
+
+    elif name == 'search_web':
+        query = args.get('query', '')
+        return f"🌐 WEB SEARCH: \"{query}\"", None
+
+    elif name == 'list_dir':
+        path = args.get('DirectoryPath', '')
+        return f"📂 LIST DIR: {path}", None
+
+    elif name == 'browser_subagent':
+        task = args.get('TaskSummary', args.get('TaskName', ''))
+        return f"🌐 BROWSER: {task}", None
+
+    elif name == 'generate_image':
+        prompt = args.get('Prompt', '')
+        return f"🎨 GENERATE IMAGE: {prompt}", None
+
+    elif name == 'ask_question':
+        questions = args.get('questions', [])
+        q_text = questions[0].get('question', '') if questions else ''
+        return f"❓ ASKING: {q_text}", None
+
+    elif name == 'manage_task':
+        action = args.get('Action', '')
+        task_id = args.get('TaskId', '')
+        return f"📋 TASK: {action} {task_id}", None
+
+    elif name == 'schedule':
+        prompt = args.get('Prompt', '')
+        return f"⏱️ SCHEDULE: {prompt}", None
+
+    elif name == 'read_url_content':
+        url = args.get('Url', '')
+        return f"🔗 READ URL: {url}", None
+
+    else:
+        summary = args.get('toolSummary', args.get('toolAction', name))
+        return f"⚙️ TOOL [{name}]: {summary}", None
+
+
 def log_tailer(project_id, file_path, stop_event):
     print(f"[TAILER] Started tailing logs for {project_id} -> {file_path}")
     try:
@@ -246,63 +365,70 @@ def log_tailer(project_id, file_path, stop_event):
                 if not line:
                     # Idle timeout (15s) -> Assume completion
                     if not done_sent and (time.time() - last_log_time) > 15.0:
-                        db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                            'text': '[STATUS: DONE]',
-                            'timestamp': int(time.time() * 1000)
-                        })
+                        _push_log(project_id, '[STATUS: DONE]', log_type='status')
                         done_sent = True
                     time.sleep(0.5)
                     continue
-                
+
                 try:
                     data = json.loads(line)
-                    log_msg = None
                     t = data.get('type')
-                    
+
                     last_log_time = time.time()
                     if done_sent and t != 'USER_INPUT':
-                        done_sent = False 
+                        done_sent = False
 
+                    # --- USER INPUT ---
                     if t == 'USER_INPUT':
-                        log_msg = f"👤 You: {data.get('content', '')}"
-                    
-                    elif t in ['MODEL_RESPONSE', 'PLANNER_RESPONSE']:
-                        text = data.get('content') or data.get('thinking') or ""
-                        if text:
-                            if len(text) > 400:
-                                text = text[:400] + "...\n[Truncated]"
-                            log_msg = f"🤖 {text.strip()}"
-                            
+                        content = data.get('content', '')
+                        if content:
+                            _push_log(project_id, f"👤 You: {content}", log_type='user')
+
+                    # --- MODEL / PLANNER RESPONSE ---
+                    elif t in ('MODEL_RESPONSE', 'PLANNER_RESPONSE'):
+                        # Thinking (internal reasoning)
+                        thinking = data.get('thinking', '')
+                        if thinking:
+                            _push_log(project_id, f"🧠 {thinking.strip()}", log_type='thinking')
+
+                        # Response body (the actual output)
+                        content = data.get('content', '')
+                        if content:
+                            _push_log(project_id, f"🤖 {content.strip()}", log_type='response')
+
+                        # Tool calls — every single one with rich detail
                         calls = data.get('tool_calls', [])
                         for call in calls:
                             name = call.get('name', '')
                             args = call.get('args', {})
-                            
-                            if name in ['replace_file_content', 'multi_replace_file_content', 'write_to_file', 'view_file']:
-                                target = args.get('TargetFile') or args.get('AbsolutePath') or 'a file'
-                                db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                                    'text': f"📝 Editing/Viewing: {target}",
-                                    'timestamp': int(time.time() * 1000)
-                                })
-                            elif name == 'run_command':
-                                cmd = args.get('CommandLine', 'command')
-                                db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                                    'text': f"💻 Running: {cmd}",
-                                    'timestamp': int(time.time() * 1000)
-                                })
-                            elif 'function' in call:
-                                func_name = call['function'].get('name', 'tool')
-                                db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                                    'text': f"⚙️ Using tool: {func_name}",
-                                    'timestamp': int(time.time() * 1000)
-                                })
-                    
-                    if log_msg:
-                        db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                            'text': log_msg,
-                            'timestamp': int(time.time() * 1000)
-                        })
-                except Exception:
+                            if not name and 'function' in call:
+                                name = call['function'].get('name', 'unknown_tool')
+                                args = call['function'].get('arguments', {})
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except Exception:
+                                        args = {}
+
+                            desc_text, file_ref = _describe_tool_call(name, args)
+                            _push_log(project_id, desc_text, log_type='tool_call', tool_name=name, file_path_ref=file_ref)
+
+                    # --- TOOL / SYSTEM RESPONSES (command output, search results, etc.) ---
+                    elif t in ('TOOL_RESPONSE', 'SYSTEM_RESPONSE', 'TOOL_OUTPUT'):
+                        content = data.get('content', '') or data.get('output', '')
+                        if content:
+                            tool_name = data.get('tool_name', data.get('name', ''))
+                            _push_log(project_id, f"📋 Result:\n{content.strip()}", log_type='result', tool_name=tool_name)
+
+                    # --- Catch-all for any other step types with content ---
+                    else:
+                        content = data.get('content', '')
+                        status = data.get('status', '')
+                        if content and t:
+                            _push_log(project_id, f"ℹ️ [{t}] {content.strip()}", log_type='status')
+
+                except Exception as e:
+                    # Log parse errors for debugging but don't crash
                     pass
     except Exception as e:
         print(f"[TAILER ERROR] {e}")
@@ -341,10 +467,8 @@ def process_task(task):
     latest_file = None
 
     # Immediately log that we received the prompt
-    db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-        'text': f'\u2699\ufe0f Processing: "{prompt[:80]}..."' if len(prompt) > 80 else f'\u2699\ufe0f Processing: "{prompt}"',
-        'timestamp': int(time.time() * 1000)
-    })
+    log_text = f'\u2699\ufe0f Processing: "{prompt[:80]}..."' if len(prompt) > 80 else f'\u2699\ufe0f Processing: "{prompt}"'
+    _push_log(project_id, log_text, log_type='status')
 
     # CRITICAL SECTION: We lock the keyboard/mouse so we don't accidentally type into the wrong window
     with gui_lock:
@@ -355,14 +479,11 @@ def process_task(task):
             db.reference(db_path).delete()
             print(f"[SUCCESS] Delivered prompt to {project_id}.")
             
-            db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                'text': '\U0001f4bb Prompt injected into IDE chat.',
-                'timestamp': int(time.time() * 1000)
-            })
+            _push_log(project_id, '💻 Prompt injected into IDE chat.', log_type='status')
 
             # Wait for IDE to log the prompt, then find the correct transcript
             latest_file = None
-            search_path = os.path.join(BRAIN_DIR, "*", ".system_generated", "logs", "transcript.jsonl")
+            search_path = os.path.join(BRAIN_DIR, "*", ".system_generated", "logs", "transcript_full.jsonl")
             prompt_json = json.dumps(prompt.strip())
             prompt_snippet = prompt_json[1:-1][:50]
             # Use the project folder name for cross-device matching
@@ -383,8 +504,8 @@ def process_task(task):
                             size = file.tell()
                             file.seek(max(0, size - 16384))
                             tail_content = file.read()
-                            # Match BOTH prompt snippet AND project folder name
-                            if prompt_snippet in tail_content and project_folder_name in tail_content.lower():
+                            # Match ONLY prompt snippet. The project name might not be in the transcript yet!
+                            if prompt_snippet in tail_content:
                                 latest_file = f
                                 break
                     except Exception:
@@ -394,8 +515,7 @@ def process_task(task):
                     break
                     
             if not latest_file:
-                # Fallback: most recently modified transcript that mentions this project
-                # (NOT globally most-recent — that causes cross-project bleed)
+                # Fallback: most recently modified transcript that has the prompt (even if older than 15s)
                 files = glob.glob(search_path)
                 for f in sorted(files, key=os.path.getmtime, reverse=True):
                     try:
@@ -404,7 +524,7 @@ def process_task(task):
                             size = file.tell()
                             file.seek(max(0, size - 16384))
                             tail_content = file.read()
-                            if project_folder_name in tail_content.lower():
+                            if prompt_snippet in tail_content:
                                 latest_file = f
                                 print(f"[TAILER] Fallback matched transcript for '{window_hint}': {f}")
                                 break
@@ -412,10 +532,7 @@ def process_task(task):
                         pass
         else:
             db.reference(db_path).update({"status": "failed_gui"})
-            db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push({
-                'text': '\u274c Failed to inject prompt into IDE.',
-                'timestamp': int(time.time() * 1000)
-            })
+            _push_log(project_id, '\u274c Failed to inject prompt into IDE.', log_type='status')
     
     # End of lock. Other projects can now type.
 
