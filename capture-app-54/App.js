@@ -4,6 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio } from 'expo-av';
 import axios from 'axios';
 import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut } from 'firebase/auth';
 import { getDatabase, ref, push, serverTimestamp, onValue, query, limitToLast } from 'firebase/database';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -21,6 +22,7 @@ const firebaseConfig = {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const database = getDatabase(app);
+const auth = getAuth(app);
 
 // Dynamic systems and projects will be loaded from Firebase
 
@@ -63,6 +65,35 @@ const LogEntry = ({ log }) => {
 };
 
 export default function Index() {
+  const [user, setUser] = useState(null);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isLoginMode, setIsLoginMode] = useState(true);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleAuth = async () => {
+    if (!email || !password) return Alert.alert('Error', 'Please enter email and password');
+    setAuthLoading(true);
+    try {
+      if (isLoginMode) {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+      }
+    } catch (e) {
+      Alert.alert('Auth Error', e.message);
+    }
+    setAuthLoading(false);
+  };
+
   const [recording, setRecording] = useState();
   const [isRecording, setIsRecording] = useState(false);
   const [promptText, setPromptText] = useState('');
@@ -104,7 +135,7 @@ export default function Index() {
 
   // Listen to active systems in Firebase
   useEffect(() => {
-    const sysRef = ref(database, 'systems');
+    const sysRef = ref(database, `users/${user.uid}/systems`);
     const unsubscribe = onValue(sysRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -124,7 +155,7 @@ export default function Index() {
   // Listen to projects for the selected system
   useEffect(() => {
     if (!selectedSystem) return;
-    const projRef = ref(database, `systems/${selectedSystem}/projects`);
+    const projRef = ref(database, `users/${user.uid}/systems/${selectedSystem}/projects`);
     const unsubscribe = onValue(projRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -144,7 +175,7 @@ export default function Index() {
 
   useEffect(() => {
     if (!selectedSystem) return;
-    const logsRef = query(ref(database, `live_logs/${selectedSystem}/${selectedProject}`), limitToLast(200));
+    const logsRef = query(ref(database, `users/${user.uid}/live_logs/${selectedSystem}/${selectedProject}`), limitToLast(200));
     const unsubscribe = onValue(logsRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -194,7 +225,7 @@ export default function Index() {
     if (!selectedSystem || !selectedProject) return;
     setTerminals([]);
     setSelectedTerminal('');
-    const termRef = ref(database, `remote_terminals/${selectedSystem}/${selectedProject}/active`);
+    const termRef = ref(database, `users/${user.uid}/remote_terminals/${selectedSystem}/${selectedProject}/active`);
     const unsubscribe = onValue(termRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -220,7 +251,7 @@ export default function Index() {
         setTerminalLogs([]);
         return;
     }
-    const logsRef = query(ref(database, `remote_terminals/${selectedSystem}/${selectedProject}/${selectedTerminal}/logs`), limitToLast(100));
+    const logsRef = query(ref(database, `users/${user.uid}/remote_terminals/${selectedSystem}/${selectedProject}/${selectedTerminal}/logs`), limitToLast(100));
     const unsubscribe = onValue(logsRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
@@ -300,7 +331,7 @@ export default function Index() {
 
     try {
       setIsProcessing(true);
-      const queueRef = ref(database, `pending_prompts/${selectedSystem}`);
+      const queueRef = ref(database, `users/${user.uid}/pending_prompts/${selectedSystem}`);
       await push(queueRef, {
         project: selectedProject,
         prompt: promptText,
@@ -322,7 +353,7 @@ export default function Index() {
   async function submitRetry() {
     try {
       setIsProcessing(true);
-      const queueRef = ref(database, `pending_prompts/${selectedSystem}`);
+      const queueRef = ref(database, `users/${user.uid}/pending_prompts/${selectedSystem}`);
       await push(queueRef, {
         project: selectedProject,
         prompt: "retry",
@@ -340,7 +371,7 @@ export default function Index() {
   async function spawnTerminal() {
     try {
       setIsProcessing(true);
-      const queueRef = ref(database, `remote_terminals/${selectedSystem}/control`);
+      const queueRef = ref(database, `users/${user.uid}/remote_terminals/${selectedSystem}/control`);
       await push(queueRef, {
         type: 'spawn',
         project: selectedProject,
@@ -359,7 +390,7 @@ export default function Index() {
     try {
       const cmd = terminalInput;
       setTerminalInput('');
-      const queueRef = ref(database, `remote_terminals/${selectedSystem}/control`);
+      const queueRef = ref(database, `users/${user.uid}/remote_terminals/${selectedSystem}/control`);
       await push(queueRef, {
         type: 'input',
         project: selectedProject,
@@ -375,6 +406,54 @@ export default function Index() {
 
   const activeSystemLabel = systems.find(s => s.value === selectedSystem)?.label || "Loading Systems...";
   const activeProjectLabel = projects.find(p => p.value === selectedProject)?.label || "Select Project";
+
+  if (authLoading) {
+    return (
+      <LinearGradient colors={['#2A1B3D', '#12121A', '#0A0A0F']} style={[styles.background, {justifyContent: 'center', alignItems: 'center'}]}>
+        <ActivityIndicator size="large" color="#0A84FF" />
+      </LinearGradient>
+    );
+  }
+
+  if (!user) {
+    return (
+      <LinearGradient colors={['#2A1B3D', '#12121A', '#0A0A0F']} style={styles.background}>
+        <SafeAreaView style={styles.safeArea}>
+          <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={[styles.container, {justifyContent: 'center'}]}>
+            <Text style={[styles.title, {textAlign: 'center', marginBottom: 40}]}>PC Link Secure</Text>
+            
+            <View style={[styles.glassContainer, {padding: 20}]}>
+              <GlassBackground intensity={50} tint="dark" />
+              <TextInput
+                style={[styles.textInput, {height: 50, padding: 10, marginBottom: 16}]}
+                placeholder="Email"
+                placeholderTextColor="rgba(255,255,255,0.4)"
+                value={email}
+                onChangeText={setEmail}
+                autoCapitalize="none"
+              />
+              <TextInput
+                style={[styles.textInput, {height: 50, padding: 10, marginBottom: 24}]}
+                placeholder="Password"
+                placeholderTextColor="rgba(255,255,255,0.4)"
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry
+              />
+              <TouchableOpacity style={styles.actionButtonWrapper} onPress={handleAuth} activeOpacity={0.7}>
+                <GlassBackground intensity={50} tint="light" androidOpacity={0.2} />
+                <Text style={styles.actionButtonText}>{isLoginMode ? 'Login' : 'Create Account'}</Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity onPress={() => setIsLoginMode(!isLoginMode)} style={{marginTop: 20}}>
+                <Text style={{color: '#0A84FF', textAlign: 'center'}}>{isLoginMode ? 'Need an account? Sign up' : 'Have an account? Log in'}</Text>
+              </TouchableOpacity>
+            </View>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </LinearGradient>
+    );
+  }
 
   return (
     <LinearGradient colors={['#2A1B3D', '#12121A', '#0A0A0F']} style={styles.background}>
@@ -418,7 +497,10 @@ export default function Index() {
         <View style={styles.modalContainer}>
             <GlassBackground intensity={100} tint="dark" androidOpacity={0.85} />
             
-            <View style={styles.modalHeader}>
+            <View style={[styles.modalHeader, {flexDirection: 'row', gap: 16}]}>
+              <TouchableOpacity onPress={() => signOut(auth)} style={styles.closeBtn}>
+                <Ionicons name="log-out" size={32} color="#FF3B30" />
+              </TouchableOpacity>
               <TouchableOpacity onPress={() => setIsNavOpen(false)} style={styles.closeBtn}>
                 <Ionicons name="close-circle" size={32} color="#ffffff" />
               </TouchableOpacity>

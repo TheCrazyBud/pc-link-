@@ -1,5 +1,6 @@
-import firebase_admin
-from firebase_admin import credentials, db
+import getpass
+from auth_client import FirebaseAuthClient, MockDB
+import device_verify
 import threading
 import time
 import os
@@ -34,69 +35,72 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(os.path.abspath(__file__))
 
-SERVICE_ACCOUNT_KEY_PATH = os.environ.get("FIREBASE_CREDENTIALS", os.path.join(application_path, "serviceAccountKey.json"))
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "AIzaSyAmozeBJHWoGOWBfs3hQhfEf07Og-LFzF4")
 DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "https://pc-link-bca30-default-rtdb.firebaseio.com")
 
-# Workspace roots where projects are located (auto-detected)
-def _detect_workspace_roots():
-    """Auto-detect common workspace directories."""
-    home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, "Downloads"),
-        os.path.join(home, "Desktop"),
-        os.path.join(home, "Documents"),
-    ]
-    # Also add drive roots (D:\, E:\, etc.) on Windows
-    if sys.platform == 'win32':
-        import string
-        for letter in string.ascii_uppercase:
-            drive = f"{letter}:\\"
-            if os.path.isdir(drive) and letter != 'C':
-                candidates.append(drive)
-    return [c for c in candidates if os.path.isdir(c)]
+auth_client = FirebaseAuthClient(FIREBASE_API_KEY, DATABASE_URL)
+db = MockDB(auth_client)
 
-WORKSPACE_ROOTS = _detect_workspace_roots()
 
-# Auto-detect the Antigravity IDE brain directory for transcript tailing
-BRAIN_DIR = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-ide", "brain")
-
-# Dynamic project registry — populated by scan_projects()
-PROJECTS = {}
-
-# 1. Initialize Firebase
-try:
-    cred = credentials.Certificate(SERVICE_ACCOUNT_KEY_PATH)
-    firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
-except Exception as e:
-    print(f"[FATAL ERROR] Could not initialize Firebase: {e}")
-    print("Please ensure your serviceAccountKey.json is present and valid.")
-    sys.exit(1)
-
-# 2. System Auto-Registration
+# 2. System Auto-Registration and Auth
 CONFIG_FILE = os.path.join(application_path, "system_config.json")
 if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, 'r') as f:
         sys_config = json.load(f)
         SYSTEM_ID = sys_config.get("id")
         SYSTEM_LABEL = sys_config.get("label")
+        refresh_token = sys_config.get("refresh_token")
+        
+    print("[AUTH] Attempting to refresh login token...")
+    success, _ = auth_client.refresh_auth_token(refresh_token)
+    if not success:
+        print("[AUTH ERROR] Session expired. Please delete system_config.json and login again.")
+        sys.exit(1)
 else:
-    print("\n" + "="*50)
+    print("
+" + "="*50)
     print("🚀 FIRST TIME SETUP: REGISTER THIS MACHINE")
     print("="*50)
     SYSTEM_LABEL = input("Enter a display name for this machine (e.g., Office Rig): ").strip()
-    # Create a simple safe ID from the label
     SYSTEM_ID = "".join(c for c in SYSTEM_LABEL if c.isalnum() or c in (' ', '_', '-')).strip().replace(' ', '_').lower()
     if not SYSTEM_ID:
         SYSTEM_ID = "default_system"
         SYSTEM_LABEL = "Default System"
+        
+    print("
+🔐 Firebase Authentication")
+    email = input("Email: ").strip()
+    password = getpass.getpass("Password: ")
     
+    print("[AUTH] Logging in...")
+    success, _ = auth_client.sign_in_with_email_password(email, password)
+    if not success:
+        print("[AUTH ERROR] Invalid email or password.")
+        sys.exit(1)
+        
     with open(CONFIG_FILE, 'w') as f:
-        json.dump({"id": SYSTEM_ID, "label": SYSTEM_LABEL}, f, indent=4)
-    print(f"\n[SAVED] Machine registered as '{SYSTEM_LABEL}' (ID: {SYSTEM_ID}).\n")
+        json.dump({"id": SYSTEM_ID, "label": SYSTEM_LABEL, "refresh_token": auth_client.refresh_token}, f, indent=4)
+    print(f"
+[SAVED] Machine registered as '{SYSTEM_LABEL}' (ID: {SYSTEM_ID}).
+")
+
+# 3. Device Verification
+print("[SECURITY] Verifying hardware license...")
+hw_id = device_verify.get_hardware_uuid()
+if not hw_id:
+    print("[FATAL] Could not determine hardware UUID.")
+    sys.exit(1)
+device_id = device_verify.generate_device_hash(hw_id)
+# You could enforce a db check here like: db.reference(f'licenses/{device_id}').get()
+if not device_verify.verify_device_license(device_id):
+    sys.exit(1)
+
+UID = auth_client.uid
+
 
 # Push presence to cloud so mobile app can discover it
 try:
-    db.reference(f'systems/{SYSTEM_ID}').set({
+    db.reference(f'users/{UID}/systems/{SYSTEM_ID}').set({
         'label': SYSTEM_LABEL,
         'value': SYSTEM_ID,
         'last_seen': int(time.time() * 1000)
@@ -172,7 +176,7 @@ def scan_projects():
                     "label": pconfig["label"],
                     "value": pid
                 }
-            db.reference(f'systems/{SYSTEM_ID}/projects').set(firebase_projects)
+            db.reference(f'users/{UID}/systems/{SYSTEM_ID}/projects').set(firebase_projects)
             print(f"[SCAN] Synced {len(PROJECTS)} projects to Firebase: {list(PROJECTS.keys())}")
         except Exception as e:
             print(f"[SCAN ERROR] Failed to push projects to Firebase: {e}")
@@ -249,7 +253,7 @@ def _push_log(project_id, text, log_type="response", tool_name=None, file_path_r
 
     if len(text) <= MAX_CHUNK:
         base_payload['text'] = text
-        db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push(base_payload)
+        db.reference(f'users/{UID}/live_logs/{SYSTEM_ID}/{project_id}').push(base_payload)
     else:
         # Chunk large messages
         chunk_id = str(uuid.uuid4())[:8]
@@ -259,7 +263,7 @@ def _push_log(project_id, text, log_type="response", tool_name=None, file_path_r
             payload['text'] = chunk
             payload['chunk_group'] = chunk_id
             payload['chunk_index'] = idx
-            db.reference(f'live_logs/{SYSTEM_ID}/{project_id}').push(payload)
+            db.reference(f'users/{UID}/live_logs/{SYSTEM_ID}/{project_id}').push(payload)
 
 
 def _describe_tool_call(name, args):
@@ -568,11 +572,11 @@ def terminal_queue_processor(terminal_id, project_id, q):
             char = q.get(timeout=0.1)
             if char is None:
                 if buffer:
-                    db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
+                    db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
                         'text': buffer,
                         'timestamp': int(time.time() * 1000)
                     })
-                db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
                     'text': "\n[Process Terminated]\n",
                     'timestamp': int(time.time() * 1000)
                 })
@@ -580,7 +584,7 @@ def terminal_queue_processor(terminal_id, project_id, q):
             buffer += char
         except queue.Empty:
             if buffer:
-                db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/{project_id}/{terminal_id}/logs').push({
                     'text': buffer,
                     'timestamp': int(time.time() * 1000)
                 })
@@ -624,17 +628,17 @@ def handle_terminal_control(event):
                 threading.Thread(target=terminal_stdout_reader, args=(term_id, proc, q), daemon=True).start()
                 threading.Thread(target=terminal_queue_processor, args=(term_id, project_id, q), daemon=True).start()
                 
-                db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed', 'terminal_id': term_id})
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed', 'terminal_id': term_id})
                 print(f"[TERMINAL] Spawned terminal {term_id} for project '{project_id}'")
                 
                 # Register under the project namespace so app only sees its own terminals
-                db.reference(f'remote_terminals/{SYSTEM_ID}/{project_id}/active/{term_id}').set({
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/{project_id}/active/{term_id}').set({
                     'status': 'running',
                     'created_at': int(time.time() * 1000)
                 })
             except Exception as e:
                 print(f"[TERMINAL ERROR] Failed to spawn: {e}")
-                db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed'})
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed'})
 
         elif action == 'input':
             term_id = data.get('terminal_id')
@@ -645,12 +649,12 @@ def handle_terminal_control(event):
                 try:
                     proc.stdin.write(cmd_text + "\n")
                     proc.stdin.flush()
-                    db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
+                    db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
                 except Exception as e:
                     print(f"[TERMINAL ERROR] Failed to send input: {e}")
-                    db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed'})
+                    db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed'})
             else:
-                db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed_dead'})
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'failed_dead'})
 
         elif action == 'kill':
             term_id = data.get('terminal_id')
@@ -662,8 +666,8 @@ def handle_terminal_control(event):
                     pass
                 proj = entry.get('project_id', project_id)
                 del ACTIVE_TERMINALS[term_id]
-                db.reference(f'remote_terminals/{SYSTEM_ID}/{proj}/active/{term_id}').remove()
-            db.reference(f'remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
+                db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/{proj}/active/{term_id}').remove()
+            db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control{path_key}').update({'status': 'executed'})
 
 def handle_new_prompt(event):
     """Fires when mobile app pushes to Firebase or on startup for existing nodes."""
@@ -710,10 +714,10 @@ scanner_thread.start()
 print("[INFO] Project auto-detection scanner started (30s interval).")
 
 # Attach the Firebase listener
-ref = db.reference(f'pending_prompts/{SYSTEM_ID}')
+ref = db.reference(f'users/{UID}/pending_prompts/{SYSTEM_ID}')
 ref.listen(handle_new_prompt)
 
-term_ref = db.reference(f'remote_terminals/{SYSTEM_ID}/control')
+term_ref = db.reference(f'users/{UID}/remote_terminals/{SYSTEM_ID}/control')
 term_ref.listen(handle_terminal_control)
 
 print(f"\n[READY] Vibe Daemon (System ID: {SYSTEM_ID.upper()}) actively listening to Firebase...")
